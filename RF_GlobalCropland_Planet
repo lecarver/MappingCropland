@@ -1,0 +1,224 @@
+var countries = ee.FeatureCollection("USDOS/LSIB_SIMPLE/2017"),
+    south_zambia = ee.FeatureCollection("users/yayao/south_zambia"),
+    polygon = 
+    /* color: #98ff00 */
+    /* shown: false */
+    /* displayProperties: [
+      {
+        "type": "rectangle"
+      }
+    ] */
+    ee.Geometry.Polygon(
+        [[[26.307895268264122, -17.594833894075105],
+          [26.307895268264122, -17.783237823026386],
+          [26.626498783889122, -17.783237823026386],
+          [26.626498783889122, -17.594833894075105]]], null, false),
+    planet = ee.ImageCollection("projects/planet-nicfi/assets/basemaps/africa"),
+    zimba = ee.FeatureCollection("projects/ee-yayao/assets/zimba"),
+    zambia = ee.FeatureCollection("projects/ee-yayao/assets/zambia");
+
+//SET UP STUDY AREA GEOMTRY 
+var south_zambia1 = ee.FeatureCollection("users/yayao/south_zambia").geometry();
+
+//PART 1 - CALCULATING NDVI & GCVI FROM PLANT-IMAGERY BANDS
+
+//Select country boundary for Zambia
+var zambia = countries.filter(ee.Filter.eq('country_na', 'Zambia'));
+
+//Computes a planet composite 
+var composite = planet.filterDate('2021-01-01', '2021-12-31').mean()
+print(composite)
+
+//Create color palette using red, green, blue bands respectively
+var trueColorVis = {min: 0, max: 0.3, bands: ['R', 'G', 'B']};
+Map.addLayer(composite.clip(south_zambia1), trueColorVis, 'composite', false);
+
+//Calculate NDVI
+var ndvicol = {min: 0, max: 1, palette: ['red', 'white', 'green']};
+var ndvi = composite.normalizedDifference(['N', 'R']).rename("NDVI") //Sub 'B5' with 'NIR' and 'B4' with 'R'
+// Map.addLayer(ndvi.clip(south_zambia), ndvicol, 'NDVI Function', false)
+
+//Calculate GCVI with Map Algebra
+var gcvicol = {min: 0, max: 1, palette: ['blue', 'white', 'green']};
+var nir = composite.select('N'); //Sub 'B5' with 'NIR'
+var green = composite.select('G');//Sub 'B3' with 'G'
+var gcvi = (nir.divide(green)).subtract(1).rename("GCVI");
+
+// Map.addLayer(gcvi.clip(south_zambia), gcvicol, 'Map Algebra GCVI' )
+
+//PART 2 - SETTING IMAGERY BANDS
+//Convert image collection to image
+var image = ee.Image(composite)
+//Add ndvi and gcvi into bands, totally 10 bands
+var img = image.addBands(ndvi).addBands(gcvi);
+print(img)
+
+//PART 3 - SETTING RANDOM SAMPLES
+// Global Cropland data from University of Maryland's Global Land & Discovery Lab
+var dat = ee.ImageCollection('users/potapovpeter/Global_cropland_2019').toList(10).get(2)
+var dat = ee.Image(dat)
+
+// Remap the land cover class values to a 0-based sequential series.
+var classValues = [0, 1];
+var remapValues = ee.List.sequence(0, 1);
+var label = 'dat';
+dat = dat.remap(classValues, remapValues).rename(label).toByte();
+print(dat)
+
+// Add land cover as a band of the reflectance image and sample 200 pixels at
+// 50 m scale from each land cover class within a region of interest.
+// Use digitize tool to draw a polygon for sample region
+var sample = img.addBands(dat).stratifiedSample({
+  numPoints: 500,
+  classBand: label,
+  region: south_zambia,
+  scale: 50,
+  geometries: true
+});
+
+
+// Add a random value field to the sample and use it to approximately split 80%
+// of the features into a training set and 20% into a validation set.
+sample = sample.randomColumn();
+var trainingSample = sample.filter('random <= 0.8');
+var validationSample = sample.filter('random > 0.8');
+print(sample)
+
+//PART4 - RANDOM FOREST 
+// Train a 100-tree random forest classifier from the training sample.
+var trainedClassifier = ee.Classifier.smileRandomForest(100).train({
+  features: trainingSample,
+  classProperty: label,
+  inputProperties: img.bandNames()
+});
+
+// Get information about the trained classifier.
+var dict = trainedClassifier.explain();
+print('Results of trained classifier', dict);
+
+// Get a confusion matrix and overall accuracy for the training sample.
+var trainAccuracy = trainedClassifier.confusionMatrix();
+print('Training error matrix', trainAccuracy);
+print('Training overall accuracy', trainAccuracy.accuracy());
+
+// Get a confusion matrix and overall accuracy for the validation sample.
+validationSample = validationSample.classify(trainedClassifier);
+var validationAccuracy = validationSample.errorMatrix(label, 'classification');
+print('Validation error matrix', validationAccuracy);
+print('Validation accuracy', validationAccuracy.accuracy());
+
+// Classify the reflectance image from the trained classifier.
+var imgClassified = img.classify(trainedClassifier);
+
+// Add the layers to the map.
+var classVis = {
+  min: 0,
+  max: 1,
+  palette: ['black' ,'green']
+};
+
+//variable importance chart
+var variable_importance = ee.Feature(null, ee.Dictionary(dict).get('importance'));
+
+var chart =
+  ui.Chart.feature.byProperty(variable_importance)
+    .setChartType('ColumnChart')
+    .setOptions({
+      title: 'Random Forest Variable Importance',
+      legend: {position: 'none'},
+      hAxis: {title: 'Bands'},
+      vAxis: {title: 'Importance'}
+    });
+
+print(chart); 
+
+
+Map.addLayer(dat, classVis, 'dat', false);
+Map.addLayer(imgClassified, classVis, 'Classified', false);
+Map.addLayer(south_zambia, {color: 'white'}, 'south zambia', false, 0.5);
+Map.addLayer(trainingSample, {color: 'black'}, 'Training sample', false);
+Map.addLayer(validationSample, {color: 'white'}, 'Validation sample', false);
+
+//Part5 Visulization of result: 
+//Clip to studay area 
+var imgClassified_SA =imgClassified.clipToCollection(south_zambia);
+Map.addLayer(imgClassified_SA,classVis, 'imgClassified_SA');
+
+//export
+Export.image.toDrive({
+  image: imgClassified_SA,
+  description: 'RF_zimba',
+  folder: 'data',
+  // region: region,
+  scale: 30,
+  crs: 'EPSG:4326',
+  maxPixels: 1e13
+});
+
+Export.image.toAsset({
+  image: imgClassified_SA,
+  description: 'RF_zimba',
+  assetId: 'projects/ee-yayao/assets/RF_zimba',  
+  scale: 30,
+  crs: 'EPSG:4326',
+  maxPixels: 1e13
+});
+
+//Calculate Area of field and non-field class
+var areaImage = ee.Image.pixelArea().addBands(
+      imgClassified_SA)
+ 
+var areas = areaImage.reduceRegion({
+      reducer: ee.Reducer.sum().group({
+      groupField: 1,
+      groupName: 'classification',
+    }),
+    geometry: south_zambia1,
+    scale: 500,
+    maxPixels: 1e10
+    }); 
+ 
+print(areas)
+
+
+//Add Labels to compare the result
+//Import tile featureCollection
+var zamtile_i = ee.FeatureCollection("users/stxiong8/Zamtile_600_i");
+
+// Use list_dir function to returns a list of the field labels in an asset collection
+var list_dir = require('users/stxiong8/Utilities:manage_asset').list_dir
+var all_fields = list_dir('projects/zamlc2020unet/assets/AEZ_I_test_Sitian/')
+
+// Merge the fields/tiles list into a single feature 
+var all_fields1 = all_fields.map(function(x){return ee.FeatureCollection(x)})
+var zamtile_i1 = zamtile_i.map(function(x){return ee.FeatureCollection(x)})
+
+// Convert to a single feature collection
+var all_fields2 = ee.FeatureCollection(all_fields1).flatten()
+var zamtile_i2 = ee.FeatureCollection(zamtile_i1).flatten()
+
+//Convert to geometry
+var all_fields3 = all_fields2.geometry()
+var zamtile_i3 = zamtile_i2.geometry()
+
+//Intersect with Sounth province of Zambia
+//south_zambia convert to geometry
+var south_zambia1 = ee.FeatureCollection(south_zambia).geometry()
+
+//fields in south province
+var label_intersection = all_fields3.intersection({'right': south_zambia1, 'maxError': 1});
+
+//grids in south province
+var grid_intersection = zamtile_i3.intersection({'right': south_zambia1, 'maxError': 1});
+
+//Create field (in the grids)
+var field_in_grid = label_intersection.intersection({'right': grid_intersection, 'maxError': 1});
+Map.addLayer(field_in_grid, {color: 'white'}, 'field', true,  0.5)
+
+//Use symmetricDifference method to create non-field
+var non_field = field_in_grid.symmetricDifference({'right': grid_intersection, 'maxError': 1});
+var non_field = ee.FeatureCollection(ee.Feature(non_field, {p:0}));
+Map.addLayer(non_field,{},'non_field')
+
+// Map.setCenter(26.051077, -16.692558,16);
+Map.setCenter(26.56644, -16.93739,16);
